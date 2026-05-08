@@ -1,24 +1,8 @@
 /**
  * aiService.js
- * Handles product recommendations through an AI API.
- * Groq is the active provider. Gemini is kept here but disabled by config
- * so it can be re-enabled later without rewriting this service.
- * Requests go through the Vite dev-server proxy to avoid CORS issues.
+ * Handles product recommendations through the Vercel API route.
+ * The browser never calls Groq/Gemini directly, so API keys stay server-side.
  */
-
-const ACTIVE_PROVIDER = import.meta.env.VITE_AI_PROVIDER ?? "groq";
-
-const GROQ_API_URL = "/api/groq/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.1-8b-instant";
-const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY ?? "";
-const isGroqKeyConfigured =
-  GROQ_API_KEY && GROQ_API_KEY !== "your-groq-api-key-here";
-
-// Disabled by default. Set VITE_AI_PROVIDER=gemini to use this again.
-const GEMINI_API_URL = "/api/gemini/v1beta/models/gemini-2.5-flash:generateContent";
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY ?? "";
-const isGeminiKeyConfigured =
-  GEMINI_API_KEY && GEMINI_API_KEY !== "your-gemini-api-key-here";
 
 const CATEGORY_SYNONYMS = {
   Phones: ["phone", "phones", "mobile", "mobiles", "smartphone", "smartphones"],
@@ -39,19 +23,6 @@ const CATEGORY_SYNONYMS = {
   Wearables: ["wearable", "wearables", "watch", "watches", "smartwatch", "smartwatches"],
   Tablets: ["tablet", "tablets", "tab", "ipad", "stylus"],
 };
-
-/**
- * Serialises the product catalog into a compact string the model can read.
- * Prices are shown in Indian Rupees (₹) so the AI respects INR budget queries.
- */
-function buildCatalogText(products) {
-  return products
-    .map(
-      (p) =>
-        `ID:${p.id} | ${p.name} | Category:${p.category} | Price:₹${p.price} | Rating:${p.rating}/5 | ${p.description} | Tags: ${p.tags.join(", ")}`
-    )
-    .join("\n");
-}
 
 function normalize(value) {
   return String(value).toLowerCase();
@@ -193,47 +164,25 @@ function withFallbackIfEmpty(result, userPreference, products) {
 }
 
 /**
- * Calls Groq with the user's preference and the full product catalog.
+ * Calls the Vercel serverless function with the user's preference and catalog.
  * Returns { summary, recommended: [{ id, reason }] }.
  */
 export async function getRecommendations(userPreference, products) {
-  const catalogText = buildCatalogText(products);
-
-  const prompt = `You are a helpful product recommendation assistant for an Indian electronics store.
-All prices are in Indian Rupees (₹). Given the user's preference below, identify the best matching products from the catalog.
-
-User preference: "${userPreference}"
-
-Product catalog:
-${catalogText}
-
-Rules:
-- Recommend between 2 and 6 products that genuinely match the preference.
-- If the user specifies a price limit (e.g. "under ₹30000"), strictly respect it — never include products above that price.
-- If the user mentions a budget in dollars, convert roughly (1 USD ≈ ₹84) before filtering.
-- If the user specifies a category or feature, filter accordingly.
-- Rank by best match first.
-
-Respond ONLY with valid JSON — no markdown fences, no extra text — in exactly this shape:
-{
-  "summary": "<2–3 sentence friendly explanation of what you found and why>",
-  "recommended": [
-    { "id": <number>, "reason": "<one short sentence, max 12 words, why this fits>" },
-    ...
-  ]
-}`;
-
   try {
-    if (ACTIVE_PROVIDER === "gemini") {
-      const result = await getGeminiRecommendations(prompt, products);
-      return withFallbackIfEmpty(
-        enforceUserConstraints(result, userPreference, products),
-        userPreference,
-        products
-      );
+    const response = await fetch("/api/recommendations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ userPreference, products }),
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err?.error || `API route error ${response.status}`);
     }
 
-    const result = await getGroqRecommendations(prompt, products);
+    const result = sanitizeResult(await response.json(), products);
     return withFallbackIfEmpty(
       enforceUserConstraints(result, userPreference, products),
       userPreference,
@@ -246,86 +195,4 @@ Respond ONLY with valid JSON — no markdown fences, no extra text — in exactl
       err.message || "request failed"
     );
   }
-}
-
-async function getGroqRecommendations(prompt, products) {
-  if (!isGroqKeyConfigured) {
-    throw new Error("missing VITE_GROQ_API_KEY");
-  }
-
-  const response = await fetch(GROQ_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: GROQ_MODEL,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: "You are a product recommendation engine. Return only valid JSON.",
-        },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Groq API error ${response.status}`);
-  }
-
-  const data = await response.json();
-  const raw = data.choices?.[0]?.message?.content ?? "";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  return sanitizeResult(JSON.parse(clean), products);
-}
-
-async function getGeminiRecommendations(prompt, products) {
-  if (!isGeminiKeyConfigured) {
-    throw new Error("missing VITE_GEMINI_API_KEY");
-  }
-
-  const response = await fetch(GEMINI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": GEMINI_API_KEY,
-    },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [
-          {
-            text: "You are a product recommendation engine. Return only valid JSON.",
-          },
-        ],
-      },
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ],
-      generationConfig: {
-        temperature: 0.2,
-        responseMimeType: "application/json",
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Gemini API error ${response.status}`);
-  }
-
-  const data = await response.json();
-  const raw =
-    data.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text ?? "")
-      .join("") ?? "";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  return sanitizeResult(JSON.parse(clean), products);
 }
